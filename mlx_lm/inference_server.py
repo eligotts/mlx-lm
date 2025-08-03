@@ -490,6 +490,10 @@ class Batcher:
         # Cache management
         self.prompt_cache = None
         self._init_cache()
+        
+        # Generation lock for safe adapter swapping
+        self.generation_lock = asyncio.Lock()
+        self.active_generations = 0
     
     def _init_cache(self):
         """Initialize prompt cache."""
@@ -549,6 +553,9 @@ class Batcher:
     async def _process_batch(self, batch: List[PromptRequest]):
         """Process a batch of requests using true batch generation."""
         start_time = time.time()
+        
+        # Track active generations for safe adapter swapping
+        self.active_generations += 1
         
         try:
             # Collect all prompts and parameters for batch processing
@@ -662,6 +669,9 @@ class Batcher:
             for req in batch:
                 if not req.future.done():
                     req.future.set_exception(e)
+        finally:
+            # Always decrement active generations
+            self.active_generations -= 1
 
 
 class InferenceServer:
@@ -745,24 +755,38 @@ class InferenceServer:
                 raise HTTPException(status_code=404, detail=f"Adapter not found: {adapter_path}")
             
             async with self.adapter_lock:
+                # Wait for all active generations to complete
+                wait_start = time.time()
+                while self.batcher.active_generations > 0:
+                    await asyncio.sleep(0.01)
+                    if time.time() - wait_start > 30:  # 30 second timeout
+                        raise HTTPException(
+                            status_code=503, 
+                            detail="Timeout waiting for active generations to complete"
+                        )
+                
                 try:
                     # Increment policy version
                     self.batcher.current_policy_version += 1
                     
-                    # Load adapter weights into the model
+                    # Load adapter weights IN-PLACE into the existing model
+                    # This avoids creating a duplicate model in memory
                     logging.info(f"Loading adapter from {adapter_path}")
                     
-                    # Create a fresh copy of the base model with the new adapter
-                    # This ensures thread safety and allows hot-swapping
-                    updated_model = load_adapters(self.model, str(adapter_path))
-                    updated_model.eval()
+                    # load_adapters modifies the model in-place and returns it
+                    # We don't need to create a new model instance
+                    load_adapters(self.model, str(adapter_path))
+                    self.model.eval()
                     
-                    # Update the model in the batcher
-                    self.batcher.model = updated_model
-                    self.model = updated_model
+                    # The model reference in batcher already points to the same model
+                    # so we don't need to update it
                     
                     # Reinitialize the prompt cache for the updated model
                     self.batcher._init_cache()
+                    
+                    # Force garbage collection to free any temporary memory
+                    import gc
+                    gc.collect()
                     
                     return JSONResponse({
                         "status": "success",
