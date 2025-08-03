@@ -378,17 +378,32 @@ async def test_lora_update(session: aiohttp.ClientSession, base_url: str):
         print(f"Initial adapter saved to: {adapter_path}")
         print(f"Number of trainable parameters: {len(adapter_weights)}")
         
-        # Load the initial adapter
-        print("\n3. Loading initial LoRA adapter...")
-        payload = {"adapter_path": str(adapter_path)}
-        async with session.post(f"{base_url}/load_adapter", json=payload) as resp:
+        # Upload the initial adapter using multipart form data
+        print("\n3. Uploading initial LoRA adapter...")
+        
+        # Prepare files for upload
+        with open(adapter_dir / "adapters.safetensors", "rb") as weights_file:
+            weights_data = weights_file.read()
+        with open(adapter_dir / "adapter_config.json", "rb") as config_file:
+            config_data = config_file.read()
+        
+        # Create multipart form data
+        form_data = aiohttp.FormData()
+        form_data.add_field('adapter_weights', weights_data, 
+                          filename='adapters.safetensors',
+                          content_type='application/octet-stream')
+        form_data.add_field('adapter_config', config_data,
+                          filename='adapter_config.json', 
+                          content_type='application/json')
+        
+        async with session.post(f"{base_url}/upload_adapter", data=form_data) as resp:
             if resp.status == 200:
                 result = await resp.json()
-                print(f"Initial adapter loaded successfully!")
+                print(f"Initial adapter uploaded successfully!")
                 print(f"Policy version: {result['policy_version']}")
             else:
                 error = await resp.text()
-                print(f"Failed to load initial adapter: {error}")
+                print(f"Failed to upload initial adapter: {error}")
                 
         # Test generation with initial adapter
         print("\n4. Testing generation with initial LoRA adapter...")
@@ -436,17 +451,32 @@ async def test_lora_update(session: aiohttp.ClientSession, base_url: str):
         
         print(f"Modified adapter saved to: {adapter_path_updated}")
         
-        # Load the modified adapter
-        print("\n6. Loading modified LoRA adapter...")
-        payload = {"adapter_path": str(adapter_path_updated)}
-        async with session.post(f"{base_url}/load_adapter", json=payload) as resp:
+        # Upload the modified adapter
+        print("\n6. Uploading modified LoRA adapter...")
+        
+        # Prepare files for upload
+        with open(adapter_dir_updated / "adapters.safetensors", "rb") as weights_file:
+            weights_data = weights_file.read()
+        with open(adapter_dir_updated / "adapter_config.json", "rb") as config_file:
+            config_data = config_file.read()
+        
+        # Create multipart form data
+        form_data = aiohttp.FormData()
+        form_data.add_field('adapter_weights', weights_data,
+                          filename='adapters.safetensors',
+                          content_type='application/octet-stream')
+        form_data.add_field('adapter_config', config_data,
+                          filename='adapter_config.json',
+                          content_type='application/json')
+        
+        async with session.post(f"{base_url}/upload_adapter", data=form_data) as resp:
             if resp.status == 200:
                 result = await resp.json()
-                print(f"Modified adapter loaded successfully!")
+                print(f"Modified adapter uploaded successfully!")
                 print(f"New policy version: {result['policy_version']}")
             else:
                 error = await resp.text()
-                print(f"Failed to load modified adapter: {error}")
+                print(f"Failed to upload modified adapter: {error}")
         
         # Test generation with modified adapter
         print("\n7. Testing generation with modified LoRA adapter...")

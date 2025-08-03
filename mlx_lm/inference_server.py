@@ -825,28 +825,41 @@ class InferenceServer:
                     raise HTTPException(status_code=500, detail=str(e))
         
         @self.app.post("/upload_adapter")
-        async def upload_adapter(file: UploadFile = File(...)):
-            """Upload and load a new LoRA adapter."""
-            temp_path = Path(f"/tmp/adapter_{uuid.uuid4()}.safetensors")
+        async def upload_adapter(
+            adapter_weights: UploadFile = File(..., description="The adapter weights file (adapters.safetensors)"),
+            adapter_config: UploadFile = File(..., description="The adapter config file (adapter_config.json)")
+        ):
+            """Upload and load a new LoRA adapter (both weights and config)."""
+            # Create a temporary directory for the adapter
+            temp_dir = Path(f"/tmp/adapter_{uuid.uuid4()}")
+            temp_dir.mkdir(exist_ok=True)
             
             try:
-                # Save uploaded file
-                content = await file.read()
-                with open(temp_path, "wb") as f:
-                    f.write(content)
+                # Save adapter weights
+                weights_content = await adapter_weights.read()
+                with open(temp_dir / "adapters.safetensors", "wb") as f:
+                    f.write(weights_content)
+                
+                # Save adapter config
+                config_content = await adapter_config.read()
+                with open(temp_dir / "adapter_config.json", "wb") as f:
+                    f.write(config_content)
                 
                 # Load the adapter
-                request = LoadAdapterRequest(adapter_path=str(temp_path))
+                request = LoadAdapterRequest(adapter_path=str(temp_dir))
                 result = await load_adapter(request)
                 
-                # Clean up temp file
-                temp_path.unlink()
+                # Clean up temp directory
+                import shutil
+                shutil.rmtree(temp_dir, ignore_errors=True)
                 
                 return result
                 
             except Exception as e:
-                if temp_path.exists():
-                    temp_path.unlink()
+                # Clean up on error
+                if temp_dir.exists():
+                    import shutil
+                    shutil.rmtree(temp_dir, ignore_errors=True)
                 raise HTTPException(status_code=500, detail=str(e))
         
         @self.app.get("/health")
