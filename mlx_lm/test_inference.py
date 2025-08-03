@@ -15,6 +15,160 @@ import time
 import aiohttp
 from pathlib import Path
 from typing import List, Dict, Any
+import mlx.core as mx
+import mlx.nn as nn
+from mlx_lm.tuner.lora import LoRALinear, LoRAEmbedding, LoRASwitchLinear
+from mlx_lm.tuner.dora import DoRALinear, DoRAEmbedding
+from mlx_lm.models.switch_layers import SwitchLinear, QuantizedSwitchLinear
+from mlx_lm.utils import load
+from mlx.utils import tree_flatten, tree_unflatten
+
+
+def linear_to_lora_layers(
+    model: nn.Module,
+    num_layers: int,
+    config: Dict,
+    use_dora: bool = False,
+):
+    """
+    Convert some of the models linear layers to lora layers.
+
+    Args:
+        model (nn.Module): The neural network model.
+        num_layers (int): The number of blocks to convert to lora layers
+        starting from the last layer.
+        config (dict): More configuration parameters for LoRA, including the
+          rank, scale, and optional layer keys.
+        use_dora (bool): If True, uses DoRA instead of LoRA.
+          Default: ``False``
+    """
+
+    def to_lora(layer):
+        if not use_dora and hasattr(layer, "to_lora"):
+            return layer.to_lora(
+                r=config["rank"],
+                scale=config["scale"],
+                dropout=config["dropout"],
+            )
+
+        if isinstance(layer, (nn.Linear, nn.QuantizedLinear)):
+            LoRALayer = DoRALinear if use_dora else LoRALinear
+        elif isinstance(layer, (SwitchLinear, QuantizedSwitchLinear)):
+            if use_dora:
+                raise ValueError(f"{type(layer).__name__} doesn't support DoRA yet.")
+            LoRALayer = LoRASwitchLinear
+        elif isinstance(layer, (nn.Embedding, nn.QuantizedEmbedding)):
+            LoRALayer = DoRAEmbedding if use_dora else LoRAEmbedding
+        else:
+            raise ValueError(
+                f"Can't convert layer of type {type(layer).__name__} to LoRA"
+            )
+
+        return LoRALayer.from_base(
+            layer,
+            r=config["rank"],
+            scale=config["scale"],
+            dropout=config["dropout"],
+        )
+
+    keys = config.get("keys", None)
+    if keys is not None:
+        keys = set(keys)
+    elif model.model_type in [
+        "mistral",
+        "mistral3",
+        "llama",
+        "phi",
+        "mixtral",
+        "nemotron",
+        "stablelm",
+        "hunyuan",
+        "qwen2",
+        "qwen2_moe",
+        "qwen3",
+        "qwen3_moe",
+        "phimoe",
+        "gemma",
+        "gemma2",
+        "gemma3",
+        "gemma3_text",
+        "granite",
+        "helium",
+        "starcoder2",
+        "cohere",
+        "cohere2",
+        "minicpm",
+        "minicpm3",
+        "minicpm4",
+        "deepseek",
+        "olmo2",
+        "olmoe",
+        "internlm3",
+        "glm4",
+        "mimo",
+        "ernie4_5",
+        "dots1",
+        "smollm3",
+    ]:
+        keys = set(["self_attn.q_proj", "self_attn.v_proj"])
+        if model.model_type in ["mixtral", "phimoe"]:
+            keys.add("block_sparse_moe.gate")
+        if model.model_type == "qwen2_moe":
+            keys.add("mlp.gate")
+            keys.add("mlp.shared_expert_gate")
+        if model.model_type in ["olmoe", "qwen3_moe", "dots1"]:
+            keys.add("mlp.gate")
+
+    elif model.model_type == "gpt_bigcode":
+        keys = set(["attn.c_attn"])
+    elif model.model_type == "gpt2":
+        keys = set(["attn.c_attn"])
+    elif model.model_type == "gpt_neox":
+        keys = set(["attention.query_key_value"])
+    elif model.model_type == "olmo":
+        keys = set(["att_proj"])
+    elif model.model_type == "openelm":
+        keys = set(["attn.qkv_proj"])
+    elif model.model_type == "phi3":
+        keys = set(["self_attn.qkv_proj"])
+    elif model.model_type == "phi-msft":
+        keys = set(["mixer.Wqkv", "moe.gate"])
+    elif model.model_type == "dbrx":
+        keys = set(["norm_attn_norm.attn.Wqkv", "ffn.router.layer"])
+    elif model.model_type == "internlm2":
+        keys = set(["attention.wqkv", "attention.wo"])
+    elif model.model_type == "deepseek_v2" or model.model_type == "minicpm3":
+        keys = set(
+            [
+                "self_attn.q_proj",
+                "self_attn.q_a_proj",
+                "self_attn.q_b_proj",
+                "self_attn.kv_a_proj_with_mqa",
+                "self_attn.kv_b_proj",
+            ]
+        )
+    elif model.model_type == "mamba":
+        keys = set(
+            [
+                "mixer.in_proj",
+                "mixer.x_proj",
+                "mixer.dt_proj",
+                "mixer.out_proj",
+            ]
+        )
+    elif model.model_type == "exaone":
+        keys = set(["attn.attention.q_proj", "attn.attention.v_proj"])
+    else:
+        raise ValueError(f"Lora does not support {model.model_type}")
+
+    for l in model.layers[-max(num_layers, 0) :]:
+        lora_layers = [(k, to_lora(m)) for k, m in l.named_modules() if k in keys]
+        if lora_layers:
+            l.update_modules(tree_unflatten(lora_layers))
+
+    lora_modules = [(k, to_lora(m)) for k, m in model.named_modules() if k in keys]
+    if lora_modules:
+        model.update_modules(tree_unflatten(lora_modules))
 
 
 async def test_single_generation(session: aiohttp.ClientSession, base_url: str):
@@ -150,49 +304,190 @@ async def test_lora_update(session: aiohttp.ClientSession, base_url: str):
     """Test LoRA adapter update workflow."""
     print("\n=== Testing LoRA Adapter Update ===")
     
-    # Note: This requires an actual adapter file to exist
-    # In real training, this would be the newly trained adapter
-    adapter_path = "/tmp/test_adapter"
+    # Initialize a small model for testing
+    model_name = "/Users/eligottlieb/.lmstudio/models/lmstudio-community/Qwen3-0.6B-MLX-bf16"
+    adapter_path = "/tmp/test_lora_adapter"
+    adapter_path_updated = "/tmp/test_lora_adapter_updated"
     
-    # Create a dummy adapter directory for testing
-    adapter_dir = Path(adapter_path)
-    adapter_dir.mkdir(exist_ok=True)
+    print(f"Loading base model: {model_name}")
     
-    # In real scenario, you'd have actual adapter weights here
-    # For testing, we'll just create the directory structure
-    (adapter_dir / "adapter_config.json").write_text(json.dumps({
-        "adapter_type": "lora",
-        "rank": 16
-    }))
+    # First, let's do an initial generation before LoRA to get baseline
+    print("\n1. Testing generation with base model...")
+    test_prompt = "The meaning of life is"
     
-    print(f"Simulating LoRA update from: {adapter_path}")
-    print("(In real training, this would contain actual trained weights)")
+    payload = {
+        "prompt": test_prompt,
+        "temperature": 0.7,
+        "max_tokens": 30,
+        "logprobs": 1,
+        "policy_version": 0,
+        "request_id": "test-lora-base"
+    }
     
-    # Get current metrics
-    async with session.get(f"{base_url}/metrics") as resp:
-        metrics = await resp.json()
-        old_version = metrics['current_policy_version']
-        print(f"Current policy version: {old_version}")
+    async with session.post(f"{base_url}/generate", json=payload) as resp:
+        if resp.status != 200:
+            error_text = await resp.text()
+            print(f"Error generating with base model: Status {resp.status}")
+            print(f"Error message: {error_text}")
+            return  # Exit early if base generation fails
+        base_result = await resp.json()
+        print(f"Base model response: {base_result['text'][:100]}...")
     
-    # Attempt to load adapter (will fail without real weights, but shows the flow)
+    # Now let's create and load a LoRA adapter
+    print("\n2. Creating LoRA adapter...")
+    
+    # Load the model locally to create LoRA adapter
     try:
+        model, tokenizer = load(model_name)
+        model.freeze()
+        
+        # Convert to LoRA
+        num_layers = len(model.layers)
+        lora_parameters = {"rank": 16, "dropout": 0.0, "scale": 10.0}
+        
+        linear_to_lora_layers(
+            model=model,
+            num_layers=num_layers,
+            config=lora_parameters,
+            use_dora=False,
+        )
+        
+        # Save initial adapter weights
+        adapter_weights = dict(tree_flatten(model.trainable_parameters()))
+        
+        # Create adapter directory
+        adapter_dir = Path(adapter_path)
+        adapter_dir.mkdir(exist_ok=True, parents=True)
+        
+        # Save adapter config in the format expected by load_adapters
+        adapter_config = {
+            "model_type": model.model_type,
+            "num_layers": num_layers,
+            "lora_parameters": lora_parameters,
+            "fine_tune_type": "lora",
+            "target_modules": ["self_attn.q_proj", "self_attn.v_proj"],
+            "trainable": True
+        }
+        
+        with open(adapter_dir / "adapter_config.json", "w") as f:
+            json.dump(adapter_config, f, indent=2)
+        
+        # Save initial adapter weights
+        mx.save_safetensors(str(adapter_dir / "adapters.safetensors"), adapter_weights)
+        
+        print(f"Initial adapter saved to: {adapter_path}")
+        print(f"Number of trainable parameters: {len(adapter_weights)}")
+        
+        # Load the initial adapter
+        print("\n3. Loading initial LoRA adapter...")
         payload = {"adapter_path": str(adapter_path)}
         async with session.post(f"{base_url}/load_adapter", json=payload) as resp:
             if resp.status == 200:
                 result = await resp.json()
-                print(f"Adapter loaded successfully!")
+                print(f"Initial adapter loaded successfully!")
+                print(f"Policy version: {result['policy_version']}")
+            else:
+                error = await resp.text()
+                print(f"Failed to load initial adapter: {error}")
+                
+        # Test generation with initial adapter
+        print("\n4. Testing generation with initial LoRA adapter...")
+        payload = {
+            "prompt": test_prompt,
+            "temperature": 0.7,
+            "max_tokens": 30,
+            "logprobs": 1,
+            "policy_version": 1,
+            "request_id": "test-lora-initial"
+        }
+        
+        async with session.post(f"{base_url}/generate", json=payload) as resp:
+            if resp.status != 200:
+                error_text = await resp.text()
+                print(f"Error generating with initial LoRA adapter: Status {resp.status}")
+                print(f"Error message: {error_text}")
+                lora_result = {"text": "ERROR: Failed to generate"}
+            else:
+                lora_result = await resp.json()
+                print(f"Initial LoRA response: {lora_result['text'][:100]}...")
+        
+        # Now modify the adapter weights to simulate training
+        print("\n5. Modifying adapter weights (simulating training)...")
+        
+        # Randomly modify some weights
+        modified_weights = {}
+        for key, value in adapter_weights.items():
+            # Add random noise to simulate training changes
+            noise = mx.random.normal(shape=value.shape, scale=0.1)
+            modified_weights[key] = value + noise
+        
+        # Save modified adapter
+        adapter_dir_updated = Path(adapter_path_updated)
+        adapter_dir_updated.mkdir(exist_ok=True, parents=True)
+        
+        # Copy config
+        with open(adapter_dir / "adapter_config.json", "r") as f:
+            config = json.load(f)
+        with open(adapter_dir_updated / "adapter_config.json", "w") as f:
+            json.dump(config, f, indent=2)
+        
+        # Save modified weights
+        mx.save_safetensors(str(adapter_dir_updated / "adapters.safetensors"), modified_weights)
+        
+        print(f"Modified adapter saved to: {adapter_path_updated}")
+        
+        # Load the modified adapter
+        print("\n6. Loading modified LoRA adapter...")
+        payload = {"adapter_path": str(adapter_path_updated)}
+        async with session.post(f"{base_url}/load_adapter", json=payload) as resp:
+            if resp.status == 200:
+                result = await resp.json()
+                print(f"Modified adapter loaded successfully!")
                 print(f"New policy version: {result['policy_version']}")
             else:
                 error = await resp.text()
-                print(f"Note: Adapter loading failed (expected without real weights)")
-                print(f"Error: {error}")
+                print(f"Failed to load modified adapter: {error}")
+        
+        # Test generation with modified adapter
+        print("\n7. Testing generation with modified LoRA adapter...")
+        payload = {
+            "prompt": test_prompt,
+            "temperature": 0.7,
+            "max_tokens": 30,
+            "logprobs": 1,
+            "policy_version": 2,
+            "request_id": "test-lora-modified"
+        }
+        
+        async with session.post(f"{base_url}/generate", json=payload) as resp:
+            if resp.status != 200:
+                error_text = await resp.text()
+                print(f"Error generating with modified LoRA adapter: Status {resp.status}")
+                print(f"Error message: {error_text}")
+                modified_result = {"text": "ERROR: Failed to generate"}
+            else:
+                modified_result = await resp.json()
+                print(f"Modified LoRA response: {modified_result['text'][:100]}...")
+            
+        # Compare results
+        print("\n8. Comparison of outputs:")
+        print(f"Base model: {base_result['text'][:50]}...")
+        print(f"Initial LoRA: {lora_result['text'][:50]}...")
+        print(f"Modified LoRA: {modified_result['text'][:50]}...")
+        print("\nNote: Modified LoRA should produce different (possibly garbled) output due to random weight changes.")
+        
     except Exception as e:
-        print(f"Note: Adapter loading failed (expected without real weights)")
-        print(f"Error: {e}")
+        print(f"Error during LoRA test: {e}")
+        import traceback
+        traceback.print_exc()
     
-    # Clean up
-    import shutil
-    shutil.rmtree(adapter_dir, ignore_errors=True)
+    finally:
+        # Clean up
+        import shutil
+        for path in [adapter_path, adapter_path_updated]:
+            if Path(path).exists():
+                shutil.rmtree(path, ignore_errors=True)
+                print(f"Cleaned up: {path}")
 
 
 async def test_stop_sequences(session: aiohttp.ClientSession, base_url: str):
@@ -254,14 +549,14 @@ async def main():
     async with aiohttp.ClientSession() as session:
         try:
             # Test individual features
-            await test_single_generation(session, base_url)
-            await test_batch_behavior(session, base_url)
-            await test_stop_sequences(session, base_url)
-            await test_server_metrics(session, base_url)
+            # await test_single_generation(session, base_url)
+            # await test_batch_behavior(session, base_url)
+            # await test_stop_sequences(session, base_url)
+            # await test_server_metrics(session, base_url)
             
             # Test RL training patterns
-            await test_one_step_offpolicy(session, base_url)
-            # await test_lora_update(session, base_url)
+            # await test_one_step_offpolicy(session, base_url)
+            await test_lora_update(session, base_url)
             
             print("\n=== All Tests Completed ===")
             

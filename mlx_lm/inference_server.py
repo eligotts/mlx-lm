@@ -147,7 +147,7 @@ def apply_repetition_penalty(logits: mx.array, generated_tokens: Any, penalty: f
 def _infer_head_dim(model):
     """
     Return the attention head dimension for *this* model implementation.
-    Works on both old and new mlx-lm versions.
+    Works on both old and new mlx-lm versions, including LoRA layers.
     """
     # 1. Newer mlx-lm keeps it on the first attention layer
     attn = model.layers[0].self_attn
@@ -156,7 +156,19 @@ def _infer_head_dim(model):
 
     # 2. Derive from q_proj weight shape: out_features == n_heads * head_dim
     n_heads = attn.n_heads
-    out_feats = attn.q_proj.weight.shape[0]   # (out_features, in_features)
+    
+    # Handle both regular Linear and LoRALinear layers
+    q_proj = attn.q_proj
+    if hasattr(q_proj, 'weight'):
+        # Regular Linear layer
+        out_feats = q_proj.weight.shape[0]
+    elif hasattr(q_proj, 'linear') and hasattr(q_proj.linear, 'weight'):
+        # LoRALinear layer - access the base linear layer
+        out_feats = q_proj.linear.weight.shape[0]
+    else:
+        # Try to get output features from the layer's out_features attribute
+        out_feats = q_proj.out_features
+    
     return out_feats // n_heads
 
 
@@ -773,9 +785,23 @@ class InferenceServer:
                     # This avoids creating a duplicate model in memory
                     logging.info(f"Loading adapter from {adapter_path}")
                     
-                    # load_adapters modifies the model in-place and returns it
-                    # We don't need to create a new model instance
-                    load_adapters(self.model, str(adapter_path))
+                    # Check if we need to apply LoRA layers or just update weights
+                    # Read the adapter config to understand what we're loading
+                    with open(adapter_path / "adapter_config.json", "r") as fid:
+                        config = json.load(fid)
+                    
+                    # Check if the model already has LoRA layers
+                    first_layer = self.model.layers[0]
+                    has_lora = hasattr(first_layer.self_attn.q_proj, 'linear')
+                    
+                    if not has_lora:
+                        # First time loading adapter - use load_adapters
+                        load_adapters(self.model, str(adapter_path))
+                    else:
+                        # Model already has LoRA layers - just load the weights
+                        logging.info("Model already has LoRA layers, updating weights only")
+                        self.model.load_weights(str(adapter_path / "adapters.safetensors"), strict=False)
+                    
                     self.model.eval()
                     
                     # The model reference in batcher already points to the same model
