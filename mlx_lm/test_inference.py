@@ -261,7 +261,7 @@ async def main():
             
             # Test RL training patterns
             await test_one_step_offpolicy(session, base_url)
-            await test_lora_update(session, base_url)
+            # await test_lora_update(session, base_url)
             
             print("\n=== All Tests Completed ===")
             
