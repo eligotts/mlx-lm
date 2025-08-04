@@ -44,86 +44,27 @@ class BatchedKVCache:
         self.values = None
         self.offset = 0
         self.step = 256
-        self.row_map = None  # For efficient batch slicing
-        self.row_len = mx.zeros((batch_size,), dtype=mx.int32)  # Per-row lengths
-
-    def select(self, active_rows):
-        """Return a lightweight view restricted to the given batch rows."""
-        import copy
-        view = copy.copy(self)
-        view.row_map = active_rows
-        return view
 
     def update_and_fetch(self, keys, values):
-        if self.row_map is not None:
-            # Called from a view - update only active rows
-            return self._update_and_fetch_selective(keys, values)
-        else:
-            # Normal full-batch update
-            return self._update_and_fetch_full(keys, values)
-    
-    def _update_and_fetch_selective(self, keys, values):
-        """Update only the active rows specified by row_map."""
-        # Ensure storage exists for the full batch
-        n_new = keys.shape[2]
-        max_len = mx.max(self.row_len).item() + n_new
-        
-        if self.keys is None or max_len > self.keys.shape[2]:
-            n_steps = (max_len + self.step - 1) // self.step
+        prev = self.offset
+        if self.keys is None or (prev + keys.shape[2]) > self.keys.shape[2]:
+            n_steps = (self.step + keys.shape[2] - 1) // self.step
             shape = (self.batch_size, self.n_kv_heads, n_steps * self.step, self.head_dim)
             new_k = mx.zeros(shape, keys.dtype)
             new_v = mx.zeros(shape, values.dtype)
             if self.keys is not None:
-                # Copy existing data
-                new_k[:, :, :self.keys.shape[2], :] = self.keys
-                new_v[:, :, :self.values.shape[2], :] = self.values
-            self.keys, self.values = new_k, new_v
+                if prev % self.step != 0:
+                    self.keys = self.keys[..., :prev, :]
+                    self.values = self.values[..., :prev, :]
+                self.keys = mx.concatenate([self.keys, new_k], axis=2)
+                self.values = mx.concatenate([self.values, new_v], axis=2)
+            else:
+                self.keys, self.values = new_k, new_v
 
-        # Update only the active rows using per-row lengths
-        for k, i in enumerate(self.row_map):
-            prev = int(self.row_len[i].item())
-            self.keys[i, :, prev : prev + n_new, :] = keys[k]
-            self.values[i, :, prev : prev + n_new, :] = values[k]
-            self.row_len[i] += n_new
-        
-        # Return the cache sliced to active rows and their individual lengths
-        cache_keys = []
-        cache_values = []
-        for k, i in enumerate(self.row_map):
-            row_length = int(self.row_len[i].item())
-            cache_keys.append(self.keys[i:i+1, :, :row_length, :])
-            cache_values.append(self.values[i:i+1, :, :row_length, :])
-        
-        return (
-            mx.concatenate(cache_keys, axis=0),
-            mx.concatenate(cache_values, axis=0)
-        )
-    
-    def _update_and_fetch_full(self, keys, values):
-        """Full-batch update using per-row tracking."""
-        n_new = keys.shape[2]
-        max_len = mx.max(self.row_len).item() + n_new
-        
-        if self.keys is None or max_len > self.keys.shape[2]:
-            n_steps = (max_len + self.step - 1) // self.step
-            shape = (self.batch_size, self.n_kv_heads, n_steps * self.step, self.head_dim)
-            new_k = mx.zeros(shape, keys.dtype)
-            new_v = mx.zeros(shape, values.dtype)
-            if self.keys is not None:
-                # Copy existing data
-                new_k[:, :, :self.keys.shape[2], :] = self.keys
-                new_v[:, :, :self.values.shape[2], :] = self.values
-            self.keys, self.values = new_k, new_v
-
-        # Update all rows
-        for i in range(self.batch_size):
-            prev = int(self.row_len[i].item())
-            self.keys[i, :, prev : prev + n_new, :] = keys[i]
-            self.values[i, :, prev : prev + n_new, :] = values[i]
-            self.row_len[i] += n_new
-        
-        # Return cache sliced to current lengths (assumes all rows have same length)
-        return self.keys[..., : int(self.row_len[0].item()), :], self.values[..., : int(self.row_len[0].item()), :]
+        self.offset += keys.shape[2]
+        self.keys[..., prev : self.offset, :] = keys
+        self.values[..., prev : self.offset, :] = values
+        return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
 
 
 @dataclass
@@ -502,10 +443,11 @@ def generate_step_efficient(
     max_tokens: int = 100,
 ) -> Generator[Tuple[mx.array, Optional[mx.array], Optional[mx.array], mx.array], None, None]:
     """
-    Generate tokens step by step with early stopping when sequences finish.
+    Generate tokens step by step with zombie-row early stopping.
     
-    This implementation uses a finished mask to avoid computing on completed sequences,
-    which significantly improves performance when sequences finish at different times.
+    This implementation uses a "zombie-row" approach where finished sequences
+    are forced to emit EOS tokens, avoiding the need for complex indexing while
+    still getting early-stop benefits.
     
     Args:
         prompts: Input token array (batch_size, seq_len)
@@ -528,7 +470,7 @@ def generate_step_efficient(
     def sample_efficient(logits: mx.array) -> Tuple[mx.array, Optional[mx.array]]:
         """
         Efficient sampling with log probabilities.
-        Returns: (tokens, log_probs) where both are (batch_active, 1) shape
+        Returns: (tokens, log_probs) where both are (batch_size, 1) shape
         """
         # --- up-cast to higher precision for numerics ---
         logits_f32 = logits.astype(mx.float32)
@@ -557,9 +499,9 @@ def generate_step_efficient(
             # Use temperature-scaled logits if temp > 0, otherwise raw logits
             computation_logits = logits_f32 * (1 / temp) if temp > 0 else logits_f32
             
-            lse = mx.logsumexp(computation_logits, axis=-1, keepdims=True)   # (batch_active, 1)
-            token_logit = mx.take_along_axis(computation_logits, tokens, axis=-1)  # (batch_active, 1)
-            log_probs = token_logit - lse                                    # (batch_active, 1)  fp32
+            lse = mx.logsumexp(computation_logits, axis=-1, keepdims=True)   # (batch_size, 1)
+            token_logit = mx.take_along_axis(computation_logits, tokens, axis=-1)  # (batch_size, 1)
+            log_probs = token_logit - lse                                    # (batch_size, 1)  fp32
 
         return tokens, log_probs
 
@@ -585,81 +527,61 @@ def generate_step_efficient(
     head_dim = _infer_head_dim(model)
     cache = [BatchedKVCache(head_dim, n, batch_size) for n in kv_heads]
 
-    # === PREFILL PHASE ===
-    # Do one forward pass with the full prompts to populate cache
-    logits = model(prompts, cache=cache)  # (batch_size, seq_len, vocab_size)
-    logits = logits[:, -1, :]  # (batch_size, vocab_size) - last position only
+    # Store the EOS token for zombie rows
+    if eos_token_id is None:
+        eos_token_id = 2  # Common default, but this should be provided
+    eos_token = mx.array([eos_token_id], dtype=prompts.dtype)
+
+    # Initial forward pass with the full prompts
+    y = prompts
     
-    # Sample first tokens
-    last_tokens, last_logprobs = sample_efficient(logits)
-    last_tokens = last_tokens[:, 0]  # (batch_size,) - flatten to 1D
+    def _step(y):
+        nonlocal finished  # Access the outer finished variable
+        
+        logits = model(y, cache=cache)
+        logits = logits[:, -1, :]  # (batch_size, vocab_size)
+        
+        # Store original logits if needed for full_logits return
+        step_logits = logits if return_full_logits else None
+        
+        # Force finished rows to produce EOS token
+        # Put -inf on all vocab positions except EOS for finished rows
+        mask = finished[:, None]  # (batch_size, 1)
+        big_neg = mx.full(logits.shape, -1e9, dtype=logits.dtype)
+        logits = mx.where(mask, big_neg, logits)
+        # Set EOS position to 0 for finished rows
+        eos_logit_mask = mx.where(finished, 0.0, logits[:, eos_token_id])
+        logits[:, eos_token_id] = eos_logit_mask
+        
+        # Sample as usual
+        tokens, log_probs = sample_efficient(logits)  # (batch_size, 1)
+        
+        # Override sampled token to EOS for finished rows (belt-and-suspenders)
+        tokens = mx.where(mask, eos_token, tokens)
+        
+        # Update finished mask based on generated tokens
+        # Check if any token matches stop tokens
+        tokens_squeezed = tokens.squeeze(axis=1)  # (batch_size,)
+        for stop_tok in stop_tokens_list:
+            finished = mx.logical_or(finished, tokens_squeezed == stop_tok)
+        
+        return tokens, log_probs, step_logits
     
-    # Arrays to accumulate full batch results
-    full_batch_tokens = mx.zeros((batch_size, 1), dtype=prompts.dtype)
-    full_batch_logprobs = mx.zeros((batch_size, 1), dtype=mx.float32) if return_logprobs else None
-    full_batch_logits = None
+    # Prefill step
+    y, logprobs, logits = _step(y)
+    mx.async_eval(y)
     
-    # === AUTOREGRESSIVE GENERATION LOOP ===
-    for step in range(max_tokens):
-        # Store current tokens
-        for i in range(batch_size):
-            full_batch_tokens[i, 0] = last_tokens[i]
-            if return_logprobs and last_logprobs is not None:
-                full_batch_logprobs[i, 0] = last_logprobs[i, 0]
+    # Autoregressive generation
+    step = 0
+    while step < max_tokens and not mx.all(finished):
+        # For next iteration
+        next_y, next_logprobs, next_logits = _step(y)
         
-        # Check for stop tokens
-        if stop_tokens_list:
-            for i in range(batch_size):
-                if not finished[i] and int(last_tokens[i]) in stop_tokens_list:
-                    finished[i] = True
+        mx.eval(y)
+        yield y, logprobs, logits, mx.array(finished)
         
-        # Prepare full batch logits if needed
-        if return_full_logits:
-            if full_batch_logits is None:
-                vocab_size = logits.shape[-1]
-                full_batch_logits = mx.zeros((batch_size, vocab_size), dtype=logits.dtype)
-            full_batch_logits[:] = logits
-        
-        # Yield results for this step
-        yield (
-            mx.array(full_batch_tokens),
-            mx.array(full_batch_logprobs) if full_batch_logprobs is not None else None,
-            mx.array(full_batch_logits) if full_batch_logits is not None else None,
-            mx.array(finished)
-        )
-        
-        # Check if all finished
-        if mx.all(finished):
-            break
-            
-        # Get active sequences
-        active_indices = []
-        for i in range(batch_size):
-            if not finished[i]:
-                active_indices.append(i)
-        
-        if not active_indices:
-            break
-            
-        # Prepare input for next step - only new tokens for active sequences
-        next_tokens_active = mx.stack([last_tokens[i:i+1] for i in active_indices])  # (batch_active, 1)
-        
-        # Create cache views for active sequences
-        cache_views = [c.select(active_indices) for c in cache]
-        
-        # Forward pass with only the new tokens
-        logits_active = model(next_tokens_active, cache=cache_views)
-        logits_active = logits_active[:, -1, :]  # (batch_active, vocab_size)
-        
-        # Sample next tokens
-        tokens_active, logprobs_active = sample_efficient(logits_active)
-        
-        # Update last_tokens and logits for active sequences
-        for k, i in enumerate(active_indices):
-            last_tokens[i] = tokens_active[k, 0]
-            logits[i] = logits_active[k]
-            if return_logprobs and logprobs_active is not None:
-                last_logprobs[i] = logprobs_active[k]
+        y, logprobs, logits = next_y, next_logprobs, next_logits
+        step += 1
 
 
 def batch_generate_efficient(
@@ -759,7 +681,6 @@ def batch_generate_efficient(
             model, 
             return_logprobs, 
             return_full_logits, 
-            eos_token_id=eos_token_id,
             stop_token_ids=stop_token_ids,
             max_tokens=max_tokens,
             **kwargs
@@ -802,21 +723,37 @@ def batch_generate_efficient(
     # Prepare return data
     result = {}
     
-    # Decode responses and strip pad/eos tokens
+    # Post-processing trim: remove everything after first EOS
     responses = []
     token_ids_list = []
+    logprobs_trimmed = [] if return_logprobs else None
     
     for i in range(batch_size):
-        # Get tokens for this sequence
-        seq_tokens = output_toks[i].tolist()
+        # Get tokens for this sequence  
+        seq_tokens = output_toks[i, :].tolist()  # Full sequence
         
-        # If sequence finished with stop token, remove it
-        if finish_reasons[i] == "stop" and seq_tokens:
-            # Remove the stop token
-            if seq_tokens[-1] == eos_token_id or (stop_token_ids and seq_tokens[-1] in stop_token_ids):
-                seq_tokens = seq_tokens[:-1]
+        # Find index of first EOS/stop token
+        eos_pos = None
+        for j, tok in enumerate(seq_tokens):
+            if tok == eos_token_id or (stop_token_ids and tok in stop_token_ids):
+                eos_pos = j
+                break
+        
+        # Trim to position before EOS (or full length if no EOS found)
+        if eos_pos is not None:
+            seq_tokens = seq_tokens[:eos_pos]
+            if finish_reasons[i] == "length":  # Update reason if we found EOS
+                finish_reasons[i] = "stop"
         
         token_ids_list.append(seq_tokens)
+        
+        # Trim logprobs to match
+        if return_logprobs and logp_stream is not None:
+            seq_len = len(seq_tokens)
+            if seq_len > 0:
+                logprobs_trimmed.append(logp_stream[i, :seq_len].tolist())
+            else:
+                logprobs_trimmed.append([])
         
         # Decode response
         if seq_tokens:
@@ -832,16 +769,8 @@ def batch_generate_efficient(
     result['finish_reasons'] = finish_reasons
     result['steps_taken'] = steps_taken
     
-    if return_logprobs and logp_stream is not None:
-        # Convert to list and trim to actual sequence lengths
-        logprobs_list = []
-        for i in range(batch_size):
-            seq_len = len(token_ids_list[i])
-            if seq_len > 0:
-                logprobs_list.append(logp_stream[i, :seq_len].tolist())
-            else:
-                logprobs_list.append([])
-        result['logprobs'] = logprobs_list
+    if return_logprobs and logprobs_trimmed is not None:
+        result['logprobs'] = logprobs_trimmed
     
     if return_full_logits and full_logits_list:
         # Stack logits across time steps and trim to sequence lengths
