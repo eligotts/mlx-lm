@@ -978,7 +978,7 @@ class Batcher:
             # Use batch_generate_detailed for true batched generation
             batch_result = await asyncio.get_event_loop().run_in_executor(
                 None,
-                lambda: batch_generate_detailed(
+                lambda: batch_generate_efficient(
                     model=self.model,
                     tokenizer=self.tokenizer,
                     prompts=prompts,
