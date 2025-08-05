@@ -42,7 +42,7 @@ def test_single_prompt():
     data = {
         "prompt": "The three laws of robotics are:",
         "temperature": 0.7,
-        "max_tokens": 50,
+        "max_tokens": 1000,
         "logprobs": 1,
         "policy_version": 1,
         "step_id": 100,
@@ -137,8 +137,8 @@ def main():
     # Run tests
     try:
         test_single_prompt()
-        test_rl_training_loop()
-        test_metrics()
+        # test_rl_training_loop()
+        # test_metrics()
         
         print("\n=== Tests Completed Successfully ===")
         

@@ -428,6 +428,384 @@ def batch_generate_detailed(
     return result
 
 
+def generate_step_efficient(
+    prompts: mx.array,
+    model: nn.Module,
+    return_logprobs: bool = True,
+    return_full_logits: bool = False,
+    temp: float = 0.0,
+    repetition_penalty: Optional[float] = None,
+    repetition_context_size: Optional[int] = 20,
+    top_p: float = 1.0,
+    logit_bias: Optional[Dict[int, float]] = None,
+    eos_token_id: Optional[int] = None,
+    stop_token_ids: Optional[List[int]] = None,
+    max_tokens: int = 100,
+) -> Generator[Tuple[mx.array, Optional[mx.array], Optional[mx.array], mx.array], None, None]:
+    """
+    Generate tokens step by step with zombie-row early stopping.
+    
+    This implementation uses a "zombie-row" approach where finished sequences
+    are forced to emit EOS tokens, avoiding the need for complex indexing while
+    still getting early-stop benefits.
+    
+    Args:
+        prompts: Input token array (batch_size, seq_len)
+        model: The language model
+        return_logprobs: Whether to return log probabilities
+        return_full_logits: Whether to return full logits
+        temp: Temperature for sampling
+        repetition_penalty: Repetition penalty factor
+        repetition_context_size: Context size for repetition penalty
+        top_p: Top-p sampling parameter
+        logit_bias: Logit bias dictionary
+        eos_token_id: EOS token ID for stopping
+        stop_token_ids: Additional stop token IDs
+        max_tokens: Maximum tokens to generate
+    
+    Yields:
+        Tuple of (tokens, logprobs, full_logits, finished_mask)
+    """
+    
+    def sample_efficient(logits: mx.array) -> Tuple[mx.array, Optional[mx.array]]:
+        """
+        Efficient sampling with log probabilities.
+        Returns: (tokens, log_probs) where both are (batch_size, 1) shape
+        """
+        # --- up-cast to higher precision for numerics ---
+        logits_f32 = logits.astype(mx.float32)
+        
+        # Optional logit_bias (unchanged)
+        if logit_bias:
+            indices = mx.array(list(logit_bias.keys()))
+            values = mx.array(list(logit_bias.values()))
+            logits[:, indices] += values
+
+        # Use bf16 for sampling (fast) but keep logits_f32 for maths below
+        if temp == 0:
+            tokens = mx.argmax(logits, axis=-1, keepdims=True)
+        else:
+            if 0.0 < top_p < 1.0:
+                tokens = top_p_sampling(logits, top_p, temp)
+            else:
+                scaled = logits * (1 / temp)
+                tokens = mx.random.categorical(scaled, axis=-1)
+                tokens = mx.expand_dims(tokens, axis=-1)
+
+        # ---------- NEW: Efficient log p for the chosen token ----------
+        # log p(x) = logit(x) - log ∑_v exp(logit(v))
+        log_probs = None
+        if return_logprobs:
+            # Use temperature-scaled logits if temp > 0, otherwise raw logits
+            computation_logits = logits_f32 * (1 / temp) if temp > 0 else logits_f32
+            
+            lse = mx.logsumexp(computation_logits, axis=-1, keepdims=True)   # (batch_size, 1)
+            token_logit = mx.take_along_axis(computation_logits, tokens, axis=-1)  # (batch_size, 1)
+            log_probs = token_logit - lse                                    # (batch_size, 1)  fp32
+
+        return tokens, log_probs
+
+    if repetition_penalty:
+        raise NotImplementedError("repetition_penalty not supported in efficient generation.")
+
+    # Initialize
+    batch_size = prompts.shape[0]
+    finished = mx.zeros((batch_size,), dtype=mx.bool_)
+    
+    # Combine EOS and stop tokens
+    all_stop_tokens = set()
+    if eos_token_id is not None:
+        all_stop_tokens.add(eos_token_id)
+    if stop_token_ids:
+        all_stop_tokens.update(stop_token_ids)
+    
+    # Convert to list for checking
+    stop_tokens_list = list(all_stop_tokens) if all_stop_tokens else []
+    
+    # Initialize KV cache
+    kv_heads = _infer_kv_heads(model)
+    head_dim = _infer_head_dim(model)
+    cache = [BatchedKVCache(head_dim, n, batch_size) for n in kv_heads]
+
+    # Store the EOS token for zombie rows
+    if eos_token_id is None:
+        eos_token_id = 2  # Common default, but this should be provided
+    eos_token = mx.array([eos_token_id], dtype=prompts.dtype)
+
+    # Initial forward pass with the full prompts
+    y = prompts
+    
+    def _step(y):
+        nonlocal finished  # Access the outer finished variable
+        
+        logits = model(y, cache=cache)
+        logits = logits[:, -1, :]  # (batch_size, vocab_size)
+        
+        # Store original logits if needed for full_logits return
+        step_logits = logits if return_full_logits else None
+        
+        # Force finished rows to produce EOS token
+        # Put -inf on all vocab positions except EOS for finished rows
+        mask = finished[:, None]  # (batch_size, 1)
+        big_neg = mx.full(logits.shape, -1e9, dtype=logits.dtype)
+        logits = mx.where(mask, big_neg, logits)
+        # Set EOS position to 0 for finished rows
+        eos_logit_mask = mx.where(finished, 0.0, logits[:, eos_token_id])
+        logits[:, eos_token_id] = eos_logit_mask
+        
+        # Sample as usual
+        tokens, log_probs = sample_efficient(logits)  # (batch_size, 1)
+        
+        # Override sampled token to EOS for finished rows (belt-and-suspenders)
+        tokens = mx.where(mask, eos_token, tokens)
+        
+        # Update finished mask based on generated tokens
+        # Check if any token matches stop tokens
+        tokens_squeezed = tokens.squeeze(axis=1)  # (batch_size,)
+        for stop_tok in stop_tokens_list:
+            finished = mx.logical_or(finished, tokens_squeezed == stop_tok)
+        
+        return tokens, log_probs, step_logits
+    
+    # Prefill step
+    y, logprobs, logits = _step(y)
+    mx.async_eval(y)
+    
+    # Autoregressive generation
+    step = 0
+    while step < max_tokens and not mx.all(finished):
+        # For next iteration
+        next_y, next_logprobs, next_logits = _step(y)
+        
+        mx.eval(y)
+        yield y, logprobs, logits, mx.array(finished)
+        
+        y, logprobs, logits = next_y, next_logprobs, next_logits
+        step += 1
+
+
+def batch_generate_efficient(
+    model: nn.Module,
+    tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
+    prompts: List[str],
+    max_tokens: int = 100,
+    verbose: bool = False,
+    format_prompts: bool = True,
+    return_logprobs: bool = True,
+    return_full_logits: bool = False,
+    stop_token: Optional[str] = None,
+    stop_token_ids: Optional[List[int]] = None,
+    **kwargs,
+) -> Dict[str, Union[List[str], List[List[int]], List[List[float]], List[mx.array]]]:
+    """
+    Generate a complete response from the model with early stopping for efficiency.
+    
+    This uses early stopping where sequences that generate EOS or stop tokens
+    are excluded from further computation, improving performance significantly
+    when sequences finish at different times.
+
+    Args:
+       model (nn.Module): The language model.
+       tokenizer (PreTrainedTokenizer): The tokenizer.
+       prompts (List[str]): List of string prompts.
+       max_tokens (int): The maximum number of tokens. Default: ``100``.
+       verbose (bool): If ``True``, print tokens and timing information.
+           Default: ``False``.
+       format_prompts (bool): Whether to apply chat formatting to prompts.
+       return_logprobs (bool): Whether to return per-token log probabilities.
+       return_full_logits (bool): Whether to return full logits for each position.
+       stop_token (str): Stop token string (defaults to tokenizer.eos_token)
+       stop_token_ids (List[int]): Additional stop token IDs
+       kwargs: The remaining options get passed to :func:`generate_step_efficient`.
+          See :func:`generate_step_efficient` for more details.
+    
+    Returns:
+        Dict containing:
+            - 'responses': List of decoded text responses
+            - 'token_ids': List of token ID sequences 
+            - 'logprobs': List of log probability sequences (if return_logprobs=True)
+            - 'full_logits': List of full logits arrays (if return_full_logits=True)
+            - 'finish_reasons': List of finish reasons ('stop' or 'length')
+            - 'steps_taken': Number of generation steps taken
+    """
+    if not isinstance(tokenizer, TokenizerWrapper):
+        tokenizer = TokenizerWrapper(tokenizer)
+
+    if verbose:
+        print("=" * 10)
+        print("Using efficient generation with early stopping")
+    
+    if format_prompts:
+        prompts_fm = [[{"role": "user", "content": prompt}] for prompt in prompts]
+        prompts_fm = [tokenizer.apply_chat_template(prompt, add_generation_prompt=True, tokenize=False) for prompt in prompts_fm]
+    else:
+        prompts_fm = prompts
+
+    # left-padding for batched generation
+    tokenizer._tokenizer.padding_side = 'left'
+    if tokenizer.pad_token is None:
+        tokenizer._tokenizer.pad_token = tokenizer.eos_token
+        tokenizer._tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    prompts_toks = mx.array(tokenizer._tokenizer(prompts_fm, padding=True)['input_ids'])
+    batch_size = prompts_toks.shape[0]
+    
+    # Setup stop tokens
+    eos_token_id = tokenizer.eos_token_id
+    
+    # Handle stop token override
+    if stop_token is not None:
+        # Encode the stop token
+        stop_token_encoded = tokenizer.encode(stop_token, add_special_tokens=False)
+        if len(stop_token_encoded) == 1:
+            # Single token stop - can be handled efficiently
+            if stop_token_ids is None:
+                stop_token_ids = []
+            stop_token_ids.append(stop_token_encoded[0])
+        else:
+            # Multi-token stop - warn and ignore for now
+            print(f"Warning: Multi-token stop sequence '{stop_token}' not supported yet, ignoring")
+    
+    tic = time.perf_counter()
+
+    # Efficient generation with early stopping
+    output_toks = []
+    logp_stream = [] if return_logprobs else None
+    full_logits_list = [] if return_full_logits else None
+    finish_reasons = ["length"] * batch_size  # Default to length
+    
+    steps_taken = 0
+    for (tokens, lp, step_logits, finished_mask), step in zip(
+        generate_step_efficient(
+            prompts_toks, 
+            model, 
+            return_logprobs, 
+            return_full_logits, 
+            stop_token_ids=stop_token_ids,
+            max_tokens=max_tokens,
+            **kwargs
+        ),
+        range(max_tokens),
+    ): 
+        if step == 0:
+            prompt_time = time.perf_counter() - tic
+            tic = time.perf_counter()
+        
+        steps_taken = step + 1
+        
+        output_toks.append(tokens)
+        if return_logprobs and lp is not None:
+            logp_stream.append(lp)
+        if return_full_logits and step_logits is not None:
+            full_logits_list.append(step_logits)
+        
+        # Update finish reasons for newly finished sequences
+        for idx in range(batch_size):
+            if finished_mask[idx] and finish_reasons[idx] == "length":
+                finish_reasons[idx] = "stop"
+        
+        # Check if all sequences are finished
+        if mx.all(finished_mask):
+            if verbose:
+                print(f"All sequences finished early at step {step + 1}")
+            break
+    
+    if output_toks:
+        output_toks = mx.concatenate(output_toks, axis=1)   # (batch_size, steps_taken)
+    else:
+        output_toks = mx.zeros((batch_size, 0), dtype=prompts_toks.dtype)
+        
+    gen_time = time.perf_counter() - tic
+    
+    if return_logprobs and logp_stream:
+        logp_stream = mx.concatenate(logp_stream, axis=1)   # (batch_size, steps_taken)
+
+    # Prepare return data
+    result = {}
+    
+    # Post-processing trim: remove everything after first EOS
+    responses = []
+    token_ids_list = []
+    logprobs_trimmed = [] if return_logprobs else None
+    
+    for i in range(batch_size):
+        # Get tokens for this sequence  
+        seq_tokens = output_toks[i, :].tolist()  # Full sequence
+        
+        # Find index of first EOS/stop token
+        eos_pos = None
+        for j, tok in enumerate(seq_tokens):
+            if tok == eos_token_id or (stop_token_ids and tok in stop_token_ids):
+                eos_pos = j
+                break
+        
+        # Trim to position before EOS (or full length if no EOS found)
+        if eos_pos is not None:
+            seq_tokens = seq_tokens[:eos_pos]
+            if finish_reasons[i] == "length":  # Update reason if we found EOS
+                finish_reasons[i] = "stop"
+        
+        token_ids_list.append(seq_tokens)
+        
+        # Trim logprobs to match
+        if return_logprobs and logp_stream is not None:
+            seq_len = len(seq_tokens)
+            if seq_len > 0:
+                logprobs_trimmed.append(logp_stream[i, :seq_len].tolist())
+            else:
+                logprobs_trimmed.append([])
+        
+        # Decode response
+        if seq_tokens:
+            response = tokenizer.decode(seq_tokens)
+            # Clean up any remaining pad tokens
+            response = response.replace(tokenizer.pad_token, "").strip()
+        else:
+            response = ""
+        responses.append(response)
+    
+    result['responses'] = responses
+    result['token_ids'] = token_ids_list
+    result['finish_reasons'] = finish_reasons
+    result['steps_taken'] = steps_taken
+    
+    if return_logprobs and logprobs_trimmed is not None:
+        result['logprobs'] = logprobs_trimmed
+    
+    if return_full_logits and full_logits_list:
+        # Stack logits across time steps and trim to sequence lengths
+        full_logits_stacked = mx.stack(full_logits_list)  # (steps, batch_size, vocab_size)
+        result['full_logits'] = []
+        for i in range(batch_size):
+            seq_len = len(token_ids_list[i])
+            if seq_len > 0:
+                result['full_logits'].append(full_logits_stacked[:seq_len, i])
+            else:
+                result['full_logits'].append(mx.zeros((0, full_logits_stacked.shape[-1])))
+    
+    if verbose:
+        prompt_tps = prompts_toks.size / prompt_time if prompt_time > 0 else 0
+        gen_tps = output_toks.size / gen_time if gen_time > 0 else 0
+        avg_seq_len = sum(len(seq) for seq in token_ids_list) / batch_size
+        early_stops = sum(1 for reason in finish_reasons if reason == "stop")
+        
+        print(f"Prompt: {prompt_tps:.3f} tokens-per-sec")
+        print(f"Generation: {gen_tps:.3f} tokens-per-sec")
+        print(f"Steps taken: {steps_taken}/{max_tokens}")
+        print(f"Average sequence length: {avg_seq_len:.1f}")
+        print(f"Early stops: {early_stops}/{batch_size}")
+        print("Log prob computation: included in generation (minimal overhead)")
+        
+        for i, (prompt, response) in enumerate(zip(prompts, responses)):
+            print("=" * 10)
+            print(f"Prompt {i+1}: {prompt}")
+            print(f"Response: {response}")
+            print(f"Finish reason: {finish_reasons[i]}")
+            print(f"Tokens generated: {len(token_ids_list[i])}")
+    
+    return result
+
+
 # Request/Response Models
 class GenerationRequest(BaseModel):
     prompt: Union[str, List[str]]

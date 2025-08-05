@@ -579,13 +579,13 @@ async def main():
     async with aiohttp.ClientSession() as session:
         try:
             # Test individual features
-            # await test_single_generation(session, base_url)
-            # await test_batch_behavior(session, base_url)
-            # await test_stop_sequences(session, base_url)
-            # await test_server_metrics(session, base_url)
+            await test_single_generation(session, base_url)
+            await test_batch_behavior(session, base_url)
+            await test_stop_sequences(session, base_url)
+            await test_server_metrics(session, base_url)
             
             # Test RL training patterns
-            # await test_one_step_offpolicy(session, base_url)
+            await test_one_step_offpolicy(session, base_url)
             await test_lora_update(session, base_url)
             
             print("\n=== All Tests Completed ===")
