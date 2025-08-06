@@ -911,6 +911,8 @@ class Batcher:
         fut = asyncio.get_event_loop().create_future()
         request_id = request_id or str(uuid.uuid4())
         
+        logging.debug(f"🎯 Batcher.submit called - request_id: {request_id}")
+        
         req = PromptRequest(
             prompt_text=prompt_text,
             options=options,
@@ -922,34 +924,49 @@ class Batcher:
         
         async with self.lock:
             self.queue.append(req)
+            queue_len = len(self.queue)
+            logging.debug(f"📥 Request queued - queue depth: {queue_len}/{self.max_batch}")
+            
             # Trigger immediate flush if batch is full
-            if len(self.queue) >= self.max_batch:
+            if queue_len >= self.max_batch:
                 batch = self.queue[:self.max_batch]
                 self.queue = self.queue[self.max_batch:]
+                logging.info(f"⚡ Queue full - immediate batch processing triggered (size: {len(batch)})")
                 asyncio.create_task(self._process_batch(batch))
         
         return await fut
     
     async def _flush_loop(self):
         """Background task that flushes the queue periodically."""
+        logging.debug(f"🔄 Batcher flush loop started - interval: {self.flush_interval:.3f}s")
         while self._running:
             await asyncio.sleep(self.flush_interval)
             async with self.lock:
                 if self.queue:
                     batch = self.queue[:self.max_batch]
                     self.queue = self.queue[len(batch):]
+                    logging.info(f"⏰ Periodic flush triggered - processing batch of {len(batch)} requests")
                     asyncio.create_task(self._process_batch(batch))
+        logging.debug("🔄 Batcher flush loop ended")
     
     async def _process_batch(self, batch: List[PromptRequest]):
         """Process a batch of requests using true batch generation."""
+        batch_id = str(uuid.uuid4())[:8]
         start_time = time.time()
+        
+        logging.info(f"🔥 Processing batch {batch_id} - {len(batch)} requests")
         
         # Track active generations for safe adapter swapping
         self.active_generations += 1
+        logging.debug(f"📈 Active generations: {self.active_generations}")
         
         try:
             # Collect all prompts and parameters for batch processing
             prompts = [req.prompt_text for req in batch]
+            
+            # Log request IDs for tracking
+            request_ids = [req.request_id for req in batch]
+            logging.debug(f"🆔 Batch {batch_id} request IDs: {request_ids}")
             
             # Get sampling parameters from first request (assume all are the same for now)
             # In a more sophisticated version, we might group by parameters
@@ -964,6 +981,8 @@ class Batcher:
                 max_tokens = options.get("max_tokens", self.max_tokens)
                 logprobs_count = options.get("logprobs", 0)
                 stop_sequences = options.get("stop", [])
+                
+                logging.debug(f"🎛️ Batch {batch_id} generation params: temp={temperature}, top_p={top_p}, max_tokens={max_tokens}")
             
             # Prepare kwargs for batch_generate_detailed
             generate_kwargs = {
@@ -974,6 +993,9 @@ class Batcher:
                 # Note: top_k and min_p are not directly supported in generate_step_detailed
                 # but we could add them if needed
             }
+            
+            logging.info(f"🚀 Starting generation for batch {batch_id}...")
+            gen_start = time.time()
             
             # Use batch_generate_detailed for true batched generation
             batch_result = await asyncio.get_event_loop().run_in_executor(
@@ -991,16 +1013,23 @@ class Batcher:
                 )
             )
             
+            gen_time = time.time() - gen_start
+            logging.info(f"⚡ Batch {batch_id} generation completed in {gen_time:.2f}s")
+            
             # Process results and fulfill futures
             responses = batch_result.get('responses', [])
             token_ids = batch_result.get('token_ids', [])
             logprobs = batch_result.get('logprobs', []) if logprobs_count > 0 else [None] * len(batch)
+            
+            logging.debug(f"📊 Batch {batch_id} results: {len(responses)} responses, {len(token_ids)} token sequences")
             
             for i, req in enumerate(batch):
                 if i < len(responses):
                     # Get the completion text
                     completion_text = responses[i]
                     completion_ids = token_ids[i] if i < len(token_ids) else []
+                    
+                    logging.debug(f"🔍 Processing result {i+1} for request {req.request_id}: {len(completion_ids)} tokens")
                     
                     # Handle stop sequences and EOS
                     finish_reason = "length"
@@ -1012,6 +1041,7 @@ class Batcher:
                         eos_pos = completion_ids.index(self.tokenizer.eos_token_id)
                         completion_ids = completion_ids[:eos_pos]
                         completion_text = self.tokenizer.decode(completion_ids)
+                        logging.debug(f"🛑 EOS found for {req.request_id} at position {eos_pos}")
                     
                     # Check for custom stop sequences
                     if stop_sequences:
@@ -1026,6 +1056,7 @@ class Batcher:
                                     if stop_seq in text_so_far:
                                         completion_ids = completion_ids[:j]
                                         break
+                                logging.debug(f"🛑 Stop sequence '{stop_seq}' found for {req.request_id}")
                                 break
                     
                     # Get prompt tokens
@@ -1048,20 +1079,24 @@ class Batcher:
                         },
                     }
                     
+                    logging.debug(f"✅ Result prepared for {req.request_id}: {len(completion_ids)} tokens, reason: {finish_reason}")
                     req.future.set_result(result)
                 else:
                     # Handle case where we didn't get enough results
+                    logging.error(f"❌ No result for request {req.request_id} (index {i})")
                     req.future.set_exception(RuntimeError("Batch generation did not return enough results"))
                 
         except Exception as e:
             # On error, reject all requests in batch
-            logging.error(f"Batch processing error: {e}")
+            logging.error(f"❌ Batch {batch_id} processing error: {type(e).__name__}: {e}")
             for req in batch:
                 if not req.future.done():
                     req.future.set_exception(e)
         finally:
             # Always decrement active generations
             self.active_generations -= 1
+            total_time = time.time() - start_time
+            logging.info(f"🏁 Batch {batch_id} completed in {total_time:.2f}s - active generations: {self.active_generations}")
 
 
 class InferenceServer:
@@ -1084,31 +1119,51 @@ class InferenceServer:
         @self.app.on_event("startup")
         async def startup():
             """Initialize model and batcher on startup."""
+            logging.info("🚀 Server startup initiated...")
             await self._init_model()
+            logging.info("✅ Server startup completed")
         
         @self.app.on_event("shutdown")
         async def shutdown():
             """Clean up on shutdown."""
+            logging.info("🛑 Server shutdown initiated...")
             if self.batcher:
+                logging.info("🔄 Stopping batcher...")
                 await self.batcher.stop()
+                logging.info("✅ Batcher stopped")
+            logging.info("✅ Server shutdown completed")
         
         @self.app.post("/generate")
         async def generate(request: GenerationRequest):
             """Generate completions for prompts."""
+            logging.info(f"🚀 /generate endpoint called - request_id: {request.request_id}")
+            logging.debug(f"📝 Generation params: temp={request.temperature}, top_p={request.top_p}, max_tokens={request.max_tokens}")
+            
             if not self.batcher:
+                logging.error("❌ Batcher not initialized - server not ready")
                 raise HTTPException(status_code=503, detail="Server not initialized")
             
             # Handle single or multiple prompts
             prompts = request.prompt if isinstance(request.prompt, list) else [request.prompt]
+            logging.info(f"📊 Processing {len(prompts)} prompt(s)")
+            
+            # Log prompt details (truncate if too long)
+            for i, prompt in enumerate(prompts):
+                prompt_preview = prompt[:100] + "..." if len(prompt) > 100 else prompt
+                logging.debug(f"📝 Prompt {i+1}: {prompt_preview}")
+            
             results = []
             
             # Convert stop sequences
             stop_sequences = request.stop or []
             if isinstance(stop_sequences, str):
                 stop_sequences = [stop_sequences]
+            logging.debug(f"🛑 Stop sequences: {stop_sequences}")
             
             # Submit all prompts
-            for prompt in prompts:
+            start_time = time.time()
+            for i, prompt in enumerate(prompts):
+                logging.debug(f"⏳ Submitting prompt {i+1} to batcher...")
                 options = {
                     "n": request.n,
                     "temperature": request.temperature,
@@ -1130,6 +1185,11 @@ class InferenceServer:
                     step_id=request.step_id,
                 )
                 results.append(result)
+                logging.debug(f"✅ Prompt {i+1} completed - generated {len(result.get('completion_ids', []))} tokens")
+            
+            total_time = time.time() - start_time
+            total_tokens = sum(len(r.get('completion_ids', [])) for r in results)
+            logging.info(f"🎉 /generate completed in {total_time:.2f}s - {total_tokens} total tokens generated")
             
             # Return single result if single prompt
             if len(results) == 1:
@@ -1139,58 +1199,90 @@ class InferenceServer:
         @self.app.post("/load_adapter")
         async def load_adapter(request: LoadAdapterRequest):
             """Load a new LoRA adapter."""
+            logging.info(f"🔄 /load_adapter endpoint called - path: {request.adapter_path}")
             adapter_path = Path(request.adapter_path)
             
             if not adapter_path.exists():
+                logging.error(f"❌ Adapter path not found: {adapter_path}")
                 raise HTTPException(status_code=404, detail=f"Adapter not found: {adapter_path}")
             
+            logging.info(f"📂 Adapter path verified: {adapter_path}")
+            
             async with self.adapter_lock:
+                logging.info(f"🔒 Acquired adapter lock, checking active generations...")
+                
                 # Wait for all active generations to complete
                 wait_start = time.time()
+                initial_active = self.batcher.active_generations
+                if initial_active > 0:
+                    logging.info(f"⏳ Waiting for {initial_active} active generations to complete...")
+                
                 while self.batcher.active_generations > 0:
                     await asyncio.sleep(0.01)
-                    if time.time() - wait_start > 30:  # 30 second timeout
+                    elapsed = time.time() - wait_start
+                    if elapsed > 30:  # 30 second timeout
+                        logging.error(f"❌ Timeout after {elapsed:.1f}s waiting for {self.batcher.active_generations} active generations")
                         raise HTTPException(
                             status_code=503, 
                             detail="Timeout waiting for active generations to complete"
                         )
                 
+                if initial_active > 0:
+                    wait_time = time.time() - wait_start
+                    logging.info(f"✅ All generations completed after {wait_time:.2f}s")
+                
                 try:
                     # Increment policy version
+                    old_version = self.batcher.current_policy_version
                     self.batcher.current_policy_version += 1
+                    logging.info(f"📈 Policy version updated: {old_version} → {self.batcher.current_policy_version}")
                     
                     # Load adapter weights IN-PLACE into the existing model
                     # This avoids creating a duplicate model in memory
-                    logging.info(f"Loading adapter from {adapter_path}")
+                    logging.info(f"🔍 Reading adapter config from {adapter_path / 'adapter_config.json'}")
                     
                     # Check if we need to apply LoRA layers or just update weights
                     # Read the adapter config to understand what we're loading
                     with open(adapter_path / "adapter_config.json", "r") as fid:
                         config = json.load(fid)
                     
+                    logging.debug(f"📋 Adapter config: {config}")
+                    
                     # Check if the model already has LoRA layers
                     first_layer = self.model.layers[0]
                     has_lora = hasattr(first_layer.self_attn.q_proj, 'linear')
+                    logging.info(f"🔧 Model has existing LoRA layers: {has_lora}")
                     
                     if not has_lora:
                         # First time loading adapter - use load_adapters
+                        logging.info("🚀 First time loading adapter - applying LoRA layers...")
                         load_adapters(self.model, str(adapter_path))
+                        logging.info("✅ LoRA layers applied successfully")
                     else:
                         # Model already has LoRA layers - just load the weights
-                        logging.info("Model already has LoRA layers, updating weights only")
-                        self.model.load_weights(str(adapter_path / "adapters.safetensors"), strict=False)
+                        logging.info("🔄 Model already has LoRA layers - updating weights only...")
+                        weights_path = adapter_path / "adapters.safetensors"
+                        logging.debug(f"📥 Loading weights from: {weights_path}")
+                        self.model.load_weights(str(weights_path), strict=False)
+                        logging.info("✅ LoRA weights updated successfully")
                     
                     self.model.eval()
+                    logging.debug("🎯 Model set to eval mode")
                     
                     # The model reference in batcher already points to the same model
                     # so we don't need to update it
                     
                     # Reinitialize the prompt cache for the updated model
+                    logging.info("🗄️ Reinitializing prompt cache...")
                     self.batcher._init_cache()
+                    logging.info("✅ Prompt cache reinitialized")
                     
                     # Force garbage collection to free any temporary memory
                     import gc
+                    logging.debug("🧹 Running garbage collection...")
                     gc.collect()
+                    
+                    logging.info(f"🎉 Adapter loaded successfully - new policy version: {self.batcher.current_policy_version}")
                     
                     return JSONResponse({
                         "status": "success",
@@ -1199,7 +1291,7 @@ class InferenceServer:
                     })
                     
                 except Exception as e:
-                    logging.error(f"Failed to load adapter: {e}")
+                    logging.error(f"❌ Failed to load adapter: {type(e).__name__}: {e}")
                     raise HTTPException(status_code=500, detail=str(e))
         
         @self.app.post("/upload_adapter")
@@ -1208,34 +1300,56 @@ class InferenceServer:
             adapter_config: UploadFile = File(..., description="The adapter config file (adapter_config.json)")
         ):
             """Upload and load a new LoRA adapter (both weights and config)."""
+            logging.info(f"📤 /upload_adapter endpoint called")
+            logging.debug(f"📎 Files received - weights: {adapter_weights.filename}, config: {adapter_config.filename}")
+            
             # Create a temporary directory for the adapter
             temp_dir = Path(f"/tmp/adapter_{uuid.uuid4()}")
+            logging.info(f"📁 Creating temporary directory: {temp_dir}")
             temp_dir.mkdir(exist_ok=True)
             
             try:
                 # Save adapter weights
+                logging.debug("💾 Reading adapter weights file...")
                 weights_content = await adapter_weights.read()
-                with open(temp_dir / "adapters.safetensors", "wb") as f:
+                weights_size = len(weights_content)
+                logging.info(f"📥 Adapter weights: {weights_size} bytes")
+                
+                weights_path = temp_dir / "adapters.safetensors"
+                with open(weights_path, "wb") as f:
                     f.write(weights_content)
+                logging.debug(f"✅ Weights saved to: {weights_path}")
                 
                 # Save adapter config
+                logging.debug("💾 Reading adapter config file...")
                 config_content = await adapter_config.read()
-                with open(temp_dir / "adapter_config.json", "wb") as f:
+                config_size = len(config_content)
+                logging.info(f"📥 Adapter config: {config_size} bytes")
+                
+                config_path = temp_dir / "adapter_config.json"
+                with open(config_path, "wb") as f:
                     f.write(config_content)
+                logging.debug(f"✅ Config saved to: {config_path}")
                 
                 # Load the adapter
+                logging.info(f"🔄 Delegating to load_adapter with temp path: {temp_dir}")
                 request = LoadAdapterRequest(adapter_path=str(temp_dir))
                 result = await load_adapter(request)
                 
                 # Clean up temp directory
+                logging.info(f"🧹 Cleaning up temporary directory: {temp_dir}")
                 import shutil
                 shutil.rmtree(temp_dir, ignore_errors=True)
+                logging.debug("✅ Temporary directory cleaned up")
                 
+                logging.info("🎉 /upload_adapter completed successfully")
                 return result
                 
             except Exception as e:
+                logging.error(f"❌ Upload adapter failed: {type(e).__name__}: {e}")
                 # Clean up on error
                 if temp_dir.exists():
+                    logging.info(f"🧹 Cleaning up temp directory after error: {temp_dir}")
                     import shutil
                     shutil.rmtree(temp_dir, ignore_errors=True)
                 raise HTTPException(status_code=500, detail=str(e))
@@ -1243,33 +1357,67 @@ class InferenceServer:
         @self.app.get("/health")
         async def health():
             """Health check endpoint."""
-            return {"status": "healthy", "model_loaded": self.model is not None}
+            logging.debug("💊 /health endpoint called")
+            model_status = self.model is not None
+            batcher_status = self.batcher is not None
+            
+            result = {
+                "status": "healthy" if model_status and batcher_status else "unhealthy", 
+                "model_loaded": model_status,
+                "batcher_initialized": batcher_status
+            }
+            
+            logging.debug(f"💊 Health check result: {result}")
+            return result
         
         @self.app.get("/metrics")
         async def metrics():
             """Get server metrics."""
+            logging.debug("📊 /metrics endpoint called")
+            
             if not self.batcher:
+                logging.debug("📊 Metrics: batcher not initialized")
                 return {"status": "not_initialized"}
             
-            return {
+            metrics_data = {
                 "current_policy_version": self.batcher.current_policy_version,
                 "queue_depth": len(self.batcher.queue),
                 "max_batch_size": self.batcher.max_batch,
                 "flush_interval_ms": self.batcher.flush_interval * 1000,
+                "active_generations": self.batcher.active_generations,
             }
+            
+            logging.debug(f"📊 Metrics data: {metrics_data}")
+            return metrics_data
     
     async def _init_model(self):
         """Initialize the model and tokenizer."""
-        logging.info(f"Loading model from {self.args.model}")
+        logging.info(f"🔧 Loading model from {self.args.model}")
+        
+        if self.args.adapter_path:
+            logging.info(f"🔌 Initial adapter path: {self.args.adapter_path}")
         
         # Load model and tokenizer
+        load_start = time.time()
         self.model, self.tokenizer = load(
             self.args.model,
             adapter_path=self.args.adapter_path,
             tokenizer_config={"trust_remote_code": self.args.trust_remote_code}
         )
+        load_time = time.time() - load_start
+        logging.info(f"✅ Model loaded in {load_time:.2f}s")
+        
+        # Log model info
+        if hasattr(self.model, 'layers') and len(self.model.layers) > 0:
+            logging.info(f"📊 Model has {len(self.model.layers)} layers")
+            
+            # Check if it has LoRA adapters
+            first_layer = self.model.layers[0]
+            has_lora = hasattr(first_layer.self_attn.q_proj, 'linear')
+            logging.info(f"🔧 Model has LoRA adapters: {has_lora}")
         
         # Initialize batcher
+        logging.info(f"🏭 Initializing batcher - max_batch: {self.args.max_batch}, flush_interval: {self.args.flush_interval_ms}ms")
         self.batcher = Batcher(
             model=self.model,
             tokenizer=self.tokenizer,
@@ -1278,8 +1426,9 @@ class InferenceServer:
             max_tokens=self.args.max_tokens,
         )
         
+        logging.info("🚀 Starting batcher...")
         await self.batcher.start()
-        logging.info("Model loaded and batcher started")
+        logging.info("✅ Model loaded and batcher started successfully")
     
     def run(self):
         """Run the server."""
@@ -1354,6 +1503,18 @@ def main():
         level=getattr(logging, args.log_level.upper()),
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
+    
+    # Log startup configuration
+    logging.info("🚀 MLX RL Inference Server starting up...")
+    logging.info(f"📊 Configuration:")
+    logging.info(f"  Model: {args.model}")
+    logging.info(f"  Adapter: {args.adapter_path or 'None'}")
+    logging.info(f"  Host: {args.host}:{args.port}")
+    logging.info(f"  Max batch: {args.max_batch}")
+    logging.info(f"  Flush interval: {args.flush_interval_ms}ms")
+    logging.info(f"  Max tokens: {args.max_tokens}")
+    logging.info(f"  Log level: {args.log_level}")
+    logging.info(f"  Trust remote code: {args.trust_remote_code}")
     
     server = InferenceServer(args)
     server.run()
