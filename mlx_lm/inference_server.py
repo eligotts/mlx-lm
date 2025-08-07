@@ -820,7 +820,6 @@ class GenerationRequest(BaseModel):
     logprobs: int = 0
     stop: Optional[Union[str, List[str]]] = None
     # RL-specific metadata
-    policy_version: Optional[Union[int, str]] = None
     step_id: Optional[int] = None
     request_id: Optional[str] = None
 
@@ -836,7 +835,6 @@ class PromptRequest:
     options: Dict[str, Any]
     future: asyncio.Future
     request_id: str
-    policy_version: Optional[Union[int, str]] = None
     step_id: Optional[int] = None
 
 
@@ -884,6 +882,9 @@ class Batcher:
         # Generation lock for safe adapter swapping
         self.generation_lock = asyncio.Lock()
         self.active_generations = 0
+        
+        # Add a lock to ensure only one batch processes at a time
+        self.batch_processing_lock = asyncio.Lock()
     
     def _init_cache(self):
         """Initialize prompt cache."""
@@ -904,7 +905,6 @@ class Batcher:
         prompt_text: str,
         options: Dict[str, Any],
         request_id: Optional[str] = None,
-        policy_version: Optional[Union[int, str]] = None,
         step_id: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Submit a request for batch processing."""
@@ -918,7 +918,6 @@ class Batcher:
             options=options,
             future=fut,
             request_id=request_id,
-            policy_version=policy_version,
             step_id=step_id,
         )
         
@@ -956,147 +955,160 @@ class Batcher:
         
         logging.info(f"🔥 Processing batch {batch_id} - {len(batch)} requests")
         
-        # Track active generations for safe adapter swapping
-        self.active_generations += 1
-        logging.debug(f"📈 Active generations: {self.active_generations}")
-        
-        try:
-            # Collect all prompts and parameters for batch processing
-            prompts = [req.prompt_text for req in batch]
+        # Acquire the batch processing lock to ensure only one batch runs at a time
+        async with self.batch_processing_lock:
+            logging.debug(f"🔒 Acquired batch processing lock for batch {batch_id}")
             
-            # Log request IDs for tracking
-            request_ids = [req.request_id for req in batch]
-            logging.debug(f"🆔 Batch {batch_id} request IDs: {request_ids}")
+            # Capture the policy version at the START of generation
+            # This is the actual version that will be used for this batch
+            generation_policy_version = self.current_policy_version
+            logging.debug(f"📌 Captured policy version for batch {batch_id}: {generation_policy_version}")
             
-            # Get sampling parameters from first request (assume all are the same for now)
-            # In a more sophisticated version, we might group by parameters
-            if batch:
-                options = batch[0].options
-                temperature = options.get("temperature", 0.0)
-                top_p = options.get("top_p", 1.0)
-                top_k = options.get("top_k", 0)
-                min_p = options.get("min_p", 0.0)
-                repetition_penalty = options.get("repetition_penalty", None)
-                repetition_context_size = options.get("repetition_context_size", 20)
-                max_tokens = options.get("max_tokens", self.max_tokens)
-                logprobs_count = options.get("logprobs", 0)
-                stop_sequences = options.get("stop", [])
+            # Track active generations for safe adapter swapping
+            self.active_generations += 1
+            logging.debug(f"📈 Active generations: {self.active_generations}")
+            
+            try:
+                # Collect all prompts and parameters for batch processing
+                prompts = [req.prompt_text for req in batch]
                 
-                logging.debug(f"🎛️ Batch {batch_id} generation params: temp={temperature}, top_p={top_p}, max_tokens={max_tokens}")
-            
-            # Prepare kwargs for batch_generate_detailed
-            generate_kwargs = {
-                "temp": temperature,
-                "top_p": top_p,
-                "repetition_penalty": repetition_penalty if repetition_penalty != 1.0 else None,
-                "repetition_context_size": repetition_context_size,
-                # Note: top_k and min_p are not directly supported in generate_step_detailed
-                # but we could add them if needed
-            }
-            
-            logging.info(f"🚀 Starting generation for batch {batch_id}...")
-            gen_start = time.time()
-            
-            # Use batch_generate_detailed for true batched generation
-            batch_result = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: batch_generate_efficient(
-                    model=self.model,
-                    tokenizer=self.tokenizer,
-                    prompts=prompts,
-                    max_tokens=max_tokens,
-                    verbose=False,
-                    format_prompts=False,  # We'll handle formatting ourselves
-                    return_logprobs=(logprobs_count > 0),
-                    return_full_logits=False,
-                    **generate_kwargs
+                # Log request IDs for tracking
+                request_ids = [req.request_id for req in batch]
+                logging.debug(f"🆔 Batch {batch_id} request IDs: {request_ids}")
+                
+                # Get sampling parameters from first request (assume all are the same for now)
+                # In a more sophisticated version, we might group by parameters
+                if batch:
+                    options = batch[0].options
+                    temperature = options.get("temperature", 0.0)
+                    top_p = options.get("top_p", 1.0)
+                    top_k = options.get("top_k", 0)
+                    min_p = options.get("min_p", 0.0)
+                    repetition_penalty = options.get("repetition_penalty", None)
+                    repetition_context_size = options.get("repetition_context_size", 20)
+                    max_tokens = options.get("max_tokens", self.max_tokens)
+                    logprobs_count = options.get("logprobs", 0)
+                    stop_sequences = options.get("stop", [])
+                    
+                    logging.debug(f"🎛️ Batch {batch_id} generation params: temp={temperature}, top_p={top_p}, max_tokens={max_tokens}")
+                
+                # Prepare kwargs for batch_generate_detailed
+                generate_kwargs = {
+                    "temp": temperature,
+                    "top_p": top_p,
+                    "repetition_penalty": repetition_penalty if repetition_penalty != 1.0 else None,
+                    "repetition_context_size": repetition_context_size,
+                    # Note: top_k and min_p are not directly supported in generate_step_detailed
+                    # but we could add them if needed
+                }
+                
+                logging.info(f"🚀 Starting generation for batch {batch_id}...")
+                gen_start = time.time()
+                
+                # Create a copy of the tokenizer to avoid concurrent modification issues
+                # This is important because batch_generate_efficient modifies tokenizer.padding_side
+                import copy
+                tokenizer_copy = copy.deepcopy(self.tokenizer)
+                
+                # Use batch_generate_detailed for true batched generation
+                batch_result = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: batch_generate_efficient(
+                        model=self.model,
+                        tokenizer=tokenizer_copy,
+                        prompts=prompts,
+                        max_tokens=max_tokens,
+                        verbose=False,
+                        format_prompts=False,  # We'll handle formatting ourselves
+                        return_logprobs=(logprobs_count > 0),
+                        return_full_logits=False,
+                        **generate_kwargs
+                    )
                 )
-            )
-            
-            gen_time = time.time() - gen_start
-            logging.info(f"⚡ Batch {batch_id} generation completed in {gen_time:.2f}s")
-            
-            # Process results and fulfill futures
-            responses = batch_result.get('responses', [])
-            token_ids = batch_result.get('token_ids', [])
-            logprobs = batch_result.get('logprobs', []) if logprobs_count > 0 else [None] * len(batch)
-            
-            logging.debug(f"📊 Batch {batch_id} results: {len(responses)} responses, {len(token_ids)} token sequences")
-            
-            for i, req in enumerate(batch):
-                if i < len(responses):
-                    # Get the completion text
-                    completion_text = responses[i]
-                    completion_ids = token_ids[i] if i < len(token_ids) else []
-                    
-                    logging.debug(f"🔍 Processing result {i+1} for request {req.request_id}: {len(completion_ids)} tokens")
-                    
-                    # Handle stop sequences and EOS
-                    finish_reason = "length"
-                    
-                    # Check if EOS token was generated
-                    if self.tokenizer.eos_token_id in completion_ids:
-                        finish_reason = "stop"
-                        # Find the position of EOS token and trim
-                        eos_pos = completion_ids.index(self.tokenizer.eos_token_id)
-                        completion_ids = completion_ids[:eos_pos]
-                        completion_text = self.tokenizer.decode(completion_ids)
-                        logging.debug(f"🛑 EOS found for {req.request_id} at position {eos_pos}")
-                    
-                    # Check for custom stop sequences
-                    if stop_sequences:
-                        for stop_seq in stop_sequences:
-                            if stop_seq in completion_text:
-                                finish_reason = "stop"
-                                completion_text = completion_text[:completion_text.find(stop_seq)]
-                                # Trim token IDs to match
-                                text_so_far = ""
-                                for j in range(len(completion_ids)):
-                                    text_so_far = self.tokenizer.decode(completion_ids[:j+1])
-                                    if stop_seq in text_so_far:
-                                        completion_ids = completion_ids[:j]
-                                        break
-                                logging.debug(f"🛑 Stop sequence '{stop_seq}' found for {req.request_id}")
-                                break
-                    
-                    # Get prompt tokens
-                    prompt_tokens = self.tokenizer.encode(req.prompt_text, add_special_tokens=True)
-                    
-                    # Build result
-                    result = {
-                        "request_id": req.request_id,
-                        "policy_version": req.policy_version or self.current_policy_version,
-                        "step_id": req.step_id,
-                        "prompt_ids": prompt_tokens,
-                        "completion_ids": completion_ids,
-                        "text": completion_text,
-                        "logprobs": logprobs[i] if logprobs and i < len(logprobs) else None,
-                        "finish_reason": finish_reason,
-                        "metadata": {
-                            "batch_size": len(batch),
-                            "latency_ms": (time.time() - start_time) * 1000,
-                            "current_policy_version": self.current_policy_version,
-                        },
-                    }
-                    
-                    logging.debug(f"✅ Result prepared for {req.request_id}: {len(completion_ids)} tokens, reason: {finish_reason}")
-                    req.future.set_result(result)
-                else:
-                    # Handle case where we didn't get enough results
-                    logging.error(f"❌ No result for request {req.request_id} (index {i})")
-                    req.future.set_exception(RuntimeError("Batch generation did not return enough results"))
                 
-        except Exception as e:
-            # On error, reject all requests in batch
-            logging.error(f"❌ Batch {batch_id} processing error: {type(e).__name__}: {e}")
-            for req in batch:
-                if not req.future.done():
-                    req.future.set_exception(e)
-        finally:
-            # Always decrement active generations
-            self.active_generations -= 1
-            total_time = time.time() - start_time
-            logging.info(f"🏁 Batch {batch_id} completed in {total_time:.2f}s - active generations: {self.active_generations}")
+                gen_time = time.time() - gen_start
+                logging.info(f"⚡ Batch {batch_id} generation completed in {gen_time:.2f}s")
+                
+                # Process results and fulfill futures
+                responses = batch_result.get('responses', [])
+                token_ids = batch_result.get('token_ids', [])
+                logprobs = batch_result.get('logprobs', []) if logprobs_count > 0 else [None] * len(batch)
+                
+                logging.debug(f"📊 Batch {batch_id} results: {len(responses)} responses, {len(token_ids)} token sequences")
+                
+                for i, req in enumerate(batch):
+                    if i < len(responses):
+                        # Get the completion text
+                        completion_text = responses[i]
+                        completion_ids = token_ids[i] if i < len(token_ids) else []
+                        
+                        logging.debug(f"🔍 Processing result {i+1} for request {req.request_id}: {len(completion_ids)} tokens")
+                        
+                        # Handle stop sequences and EOS
+                        finish_reason = "length"
+                        
+                        # Check if EOS token was generated
+                        if self.tokenizer.eos_token_id in completion_ids:
+                            finish_reason = "stop"
+                            # Find the position of EOS token and trim
+                            eos_pos = completion_ids.index(self.tokenizer.eos_token_id)
+                            completion_ids = completion_ids[:eos_pos]
+                            completion_text = self.tokenizer.decode(completion_ids)
+                            logging.debug(f"🛑 EOS found for {req.request_id} at position {eos_pos}")
+                        
+                        # Check for custom stop sequences
+                        if stop_sequences:
+                            for stop_seq in stop_sequences:
+                                if stop_seq in completion_text:
+                                    finish_reason = "stop"
+                                    completion_text = completion_text[:completion_text.find(stop_seq)]
+                                    # Trim token IDs to match
+                                    text_so_far = ""
+                                    for j in range(len(completion_ids)):
+                                        text_so_far = self.tokenizer.decode(completion_ids[:j+1])
+                                        if stop_seq in text_so_far:
+                                            completion_ids = completion_ids[:j]
+                                            break
+                                    logging.debug(f"🛑 Stop sequence '{stop_seq}' found for {req.request_id}")
+                                    break
+                        
+                        # Get prompt tokens
+                        prompt_tokens = self.tokenizer.encode(req.prompt_text, add_special_tokens=True)
+                        
+                        # Build result
+                        result = {
+                            "request_id": req.request_id,
+                            "policy_version": generation_policy_version,  # The actual version used for generation
+                            "step_id": req.step_id,
+                            "prompt_ids": prompt_tokens,
+                            "completion_ids": completion_ids,
+                            "text": completion_text,
+                            "logprobs": logprobs[i] if logprobs and i < len(logprobs) else None,
+                            "finish_reason": finish_reason,
+                            "metadata": {
+                                "batch_size": len(batch),
+                                "latency_ms": (time.time() - start_time) * 1000,
+                            },
+                        }
+                        
+                        logging.debug(f"✅ Result prepared for {req.request_id}: {len(completion_ids)} tokens, reason: {finish_reason}")
+                        req.future.set_result(result)
+                    else:
+                        # Handle case where we didn't get enough results
+                        logging.error(f"❌ No result for request {req.request_id} (index {i})")
+                        req.future.set_exception(RuntimeError("Batch generation did not return enough results"))
+                    
+            except Exception as e:
+                # On error, reject all requests in batch
+                logging.error(f"❌ Batch {batch_id} processing error: {type(e).__name__}: {e}")
+                for req in batch:
+                    if not req.future.done():
+                        req.future.set_exception(e)
+            finally:
+                # Always decrement active generations
+                self.active_generations -= 1
+                total_time = time.time() - start_time
+                logging.info(f"🏁 Batch {batch_id} completed in {total_time:.2f}s - active generations: {self.active_generations}")
 
 
 class InferenceServer:
@@ -1108,6 +1120,7 @@ class InferenceServer:
         self.tokenizer = None
         self.batcher = None
         self.adapter_lock = asyncio.Lock()
+        self.has_lora_layers = False
         
         # Initialize FastAPI app
         self.app = FastAPI(title="MLX RL Inference Server")
@@ -1181,7 +1194,6 @@ class InferenceServer:
                     prompt_text=prompt,
                     options=options,
                     request_id=request.request_id,
-                    policy_version=request.policy_version,
                     step_id=request.step_id,
                 )
                 results.append(result)
@@ -1249,14 +1261,13 @@ class InferenceServer:
                     logging.debug(f"📋 Adapter config: {config}")
                     
                     # Check if the model already has LoRA layers
-                    first_layer = self.model.layers[0]
-                    has_lora = hasattr(first_layer.self_attn.q_proj, 'linear')
-                    logging.info(f"🔧 Model has existing LoRA layers: {has_lora}")
+                    logging.info(f"🔧 Model has existing LoRA layers: {self.has_lora_layers}")
                     
-                    if not has_lora:
+                    if not self.has_lora_layers:
                         # First time loading adapter - use load_adapters
                         logging.info("🚀 First time loading adapter - applying LoRA layers...")
                         load_adapters(self.model, str(adapter_path))
+                        self.has_lora_layers = True
                         logging.info("✅ LoRA layers applied successfully")
                     else:
                         # Model already has LoRA layers - just load the weights
@@ -1411,10 +1422,12 @@ class InferenceServer:
         if hasattr(self.model, 'layers') and len(self.model.layers) > 0:
             logging.info(f"📊 Model has {len(self.model.layers)} layers")
             
-            # Check if it has LoRA adapters
-            first_layer = self.model.layers[0]
-            has_lora = hasattr(first_layer.self_attn.q_proj, 'linear')
-            logging.info(f"🔧 Model has LoRA adapters: {has_lora}")
+            # Check if it has LoRA adapters (if adapter_path was provided during init)
+            if self.args.adapter_path:
+                self.has_lora_layers = True
+                logging.info(f"🔧 Model initialized with LoRA adapters from: {self.args.adapter_path}")
+            else:
+                logging.info("🔧 Model initialized without LoRA adapters")
         
         # Initialize batcher
         logging.info(f"🏭 Initializing batcher - max_batch: {self.args.max_batch}, flush_interval: {self.args.flush_interval_ms}ms")
